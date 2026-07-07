@@ -234,7 +234,7 @@ case $algorithm in
 esac
 
 bridge_ratio_correction=${bridge_ratio_correction:-none}
-bridge_ratio_score_scale=${bridge_ratio_score_scale:-token}
+bridge_ratio_score_scale=${bridge_ratio_score_scale:-sequence}
 bridge_ratio_alpha=${bridge_ratio_alpha:-1.0}
 bridge_ratio_adaptive_alpha=${bridge_ratio_adaptive_alpha:-false}
 bridge_ratio_alpha_min=${bridge_ratio_alpha_min:-0.0}

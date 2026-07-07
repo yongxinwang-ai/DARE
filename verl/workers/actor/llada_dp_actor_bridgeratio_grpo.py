@@ -56,7 +56,7 @@ class DLLMDataParallelPPOActor(CoupledDataParallelPPOActor):
         self.bridge_ratio_estimator = config.get("bridge_ratio_estimator", "bridge")
         self.bridge_ratio_correction = config.get("bridge_ratio_correction", "none")
         self.bridge_ratio_detach_correction = _as_bool(config.get("bridge_ratio_detach_correction", True))
-        self.bridge_ratio_score_scale = config.get("bridge_ratio_score_scale", "token")
+        self.bridge_ratio_score_scale = config.get("bridge_ratio_score_scale", "sequence")
         self.bridge_ratio_log_clip = _none_if_string(config.get("bridge_ratio_log_clip", None))
         if self.bridge_ratio_log_clip is not None:
             self.bridge_ratio_log_clip = float(self.bridge_ratio_log_clip)
