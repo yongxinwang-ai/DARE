@@ -23,19 +23,252 @@ def _cv_squared_from_log_weights(log_weights: torch.Tensor, eps: float = 1e-8) -
     return var / mean.square().clamp_min(eps)
 
 
+def _expand_bridge_alpha(alpha, target: torch.Tensor) -> torch.Tensor:
+    if not isinstance(alpha, torch.Tensor):
+        alpha = torch.tensor(float(alpha), dtype=target.dtype, device=target.device)
+    else:
+        alpha = alpha.to(dtype=target.dtype, device=target.device)
+    if alpha.dim() == 0:
+        return alpha.reshape(*([1] * target.dim()))
+    while alpha.dim() < target.dim():
+        alpha = alpha.unsqueeze(1)
+    return alpha
+
+
+def _bridge_alpha_for_output(alpha, output: torch.Tensor) -> torch.Tensor:
+    return _expand_bridge_alpha(alpha, output)
+
+
+def _estimate_tempered_bridge_log_ratio(
+    l_theta_paths: torch.Tensor,
+    old_l_theta_paths: torch.Tensor,
+    alpha,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    path_delta = l_theta_paths - old_l_theta_paths
+    alpha_expanded = _expand_bridge_alpha(alpha, old_l_theta_paths)
+    old_log_denom = torch.logsumexp(old_l_theta_paths, dim=1)
+    old_bridge_weights = torch.softmax(old_l_theta_paths, dim=1)
+    first_order = (old_bridge_weights * path_delta).sum(dim=1)
+    alpha_out = _bridge_alpha_for_output(alpha, old_log_denom)
+
+    alpha_safe = torch.where(alpha_out.abs() < eps, torch.ones_like(alpha_out), alpha_out)
+    tempered_log_num = torch.logsumexp(old_l_theta_paths + alpha_expanded * path_delta, dim=1)
+    tempered = (tempered_log_num - old_log_denom) / alpha_safe
+    return torch.where(alpha_out.abs() < eps, first_order, tempered)
+
+
+def _bridge_effective_sample_size(l_theta_paths: torch.Tensor, old_l_theta_paths: torch.Tensor, alpha) -> torch.Tensor:
+    path_delta = l_theta_paths - old_l_theta_paths
+    alpha_expanded = _expand_bridge_alpha(alpha, old_l_theta_paths)
+    log_weights = old_l_theta_paths + alpha_expanded * path_delta
+    log_sum = torch.logsumexp(log_weights, dim=1)
+    log_sum_sq = torch.logsumexp(2 * log_weights, dim=1)
+    return torch.exp(2 * log_sum - log_sum_sq)
+
+
+def select_bridge_alpha_by_ess(
+    l_theta_paths: torch.Tensor,
+    old_l_theta_paths: torch.Tensor,
+    alpha_max: float = 1.0,
+    alpha_min: float = 0.0,
+    alpha_steps: int = 11,
+    ess_target: float = 0.3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Choose the largest alpha whose tempered bridge ESS is at least ess_target * K.
+    """
+    assert alpha_steps >= 1, f"alpha_steps must be positive, got {alpha_steps}"
+    num_paths = l_theta_paths.size(1)
+    log_ratio_shape = torch.logsumexp(old_l_theta_paths, dim=1).shape
+    if alpha_steps == 1:
+        selected_alpha = torch.full(log_ratio_shape, float(alpha_max), dtype=l_theta_paths.dtype, device=l_theta_paths.device)
+        return selected_alpha, _bridge_effective_sample_size(l_theta_paths, old_l_theta_paths, selected_alpha)
+
+    alpha_grid = torch.linspace(float(alpha_min), float(alpha_max), steps=alpha_steps, dtype=l_theta_paths.dtype, device=l_theta_paths.device)
+    threshold = float(ess_target) * float(num_paths)
+    best_alpha = torch.full(log_ratio_shape, float(alpha_min), dtype=l_theta_paths.dtype, device=l_theta_paths.device)
+    best_ess = _bridge_effective_sample_size(l_theta_paths, old_l_theta_paths, best_alpha)
+
+    for alpha_value in alpha_grid:
+        alpha_tensor = torch.full(log_ratio_shape, alpha_value.item(), dtype=l_theta_paths.dtype, device=l_theta_paths.device)
+        ess = _bridge_effective_sample_size(l_theta_paths, old_l_theta_paths, alpha_tensor)
+        is_valid = ess >= threshold
+        best_alpha = torch.where(is_valid, alpha_tensor, best_alpha)
+        best_ess = torch.where(is_valid, ess, best_ess)
+
+    return best_alpha, best_ess
+
+
+def estimate_thermobridge_log_ratio(
+    l_theta_paths: torch.Tensor,
+    old_l_theta_paths: torch.Tensor,
+    num_points: int = 5,
+) -> torch.Tensor:
+    """
+    Diagnostic thermodynamic-integration bridge estimate of log Z_theta / Z_old.
+    """
+    assert num_points >= 2, f"num_points must be at least 2, got {num_points}"
+    path_delta = l_theta_paths - old_l_theta_paths
+    alpha_grid = torch.linspace(0.0, 1.0, steps=num_points, dtype=l_theta_paths.dtype, device=l_theta_paths.device)
+    expectations = []
+    for alpha_value in alpha_grid:
+        weights = torch.softmax(old_l_theta_paths + alpha_value * path_delta, dim=1)
+        expectations.append((weights * path_delta).sum(dim=1))
+    expectations = torch.stack(expectations, dim=0)
+    weights = torch.ones(num_points, dtype=l_theta_paths.dtype, device=l_theta_paths.device)
+    weights[0] = weights[-1] = 0.5
+    return (weights.view(-1, *([1] * (expectations.dim() - 1))) * expectations).sum(dim=0) / (num_points - 1)
+
+
+def _contiguous_group_ids(num_paths: int, group_size: int, device) -> torch.Tensor:
+    group_size = max(int(group_size), 1)
+    return torch.arange(num_paths, device=device) // group_size
+
+
+def _logmeanexp_by_group(values: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
+    if group_ids.dim() == 1:
+        group_ids = group_ids.view(1, -1).expand(values.size(0), -1)
+    assert group_ids.shape[:2] == values.shape[:2], f"group_ids must match batch/path dims, got {group_ids.shape} for {values.shape}"
+
+    grouped_values = []
+    for batch_idx in range(values.size(0)):
+        cur_groups = []
+        for group_id in torch.unique(group_ids[batch_idx], sorted=True):
+            mask = group_ids[batch_idx] == group_id
+            cur_groups.append(torch.logsumexp(values[batch_idx, mask, ...], dim=0) - mask.float().sum().log())
+        grouped_values.append(torch.stack(cur_groups, dim=0))
+    return torch.stack(grouped_values, dim=0)
+
+
+def _softmax_mean_by_group(values: torch.Tensor, log_weights: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
+    if group_ids.dim() == 1:
+        group_ids = group_ids.view(1, -1).expand(values.size(0), -1)
+    assert group_ids.shape[:2] == values.shape[:2], f"group_ids must match batch/path dims, got {group_ids.shape} for {values.shape}"
+
+    grouped_values = []
+    for batch_idx in range(values.size(0)):
+        cur_groups = []
+        for group_id in torch.unique(group_ids[batch_idx], sorted=True):
+            mask = group_ids[batch_idx] == group_id
+            weights = torch.softmax(log_weights[batch_idx, mask, ...], dim=0)
+            cur_groups.append((weights * values[batch_idx, mask, ...]).sum(dim=0))
+        grouped_values.append(torch.stack(cur_groups, dim=0))
+    return torch.stack(grouped_values, dim=0)
+
+
+def estimate_rao_blackwellized_bridge_log_ratio(
+    l_theta_paths: torch.Tensor,
+    old_l_theta_paths: torch.Tensor,
+    alpha: float = 1.0,
+    group_ids: torch.Tensor | None = None,
+    group_size: int | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Rao-Blackwellized bridge estimate by averaging path-order randomness within groups.
+    """
+    if group_ids is None and group_size is None:
+        return _estimate_tempered_bridge_log_ratio(l_theta_paths, old_l_theta_paths, alpha=alpha, eps=eps)
+    if group_ids is None:
+        group_ids = _contiguous_group_ids(l_theta_paths.size(1), group_size, l_theta_paths.device)
+
+    path_delta = l_theta_paths - old_l_theta_paths
+    alpha_expanded = _expand_bridge_alpha(alpha, old_l_theta_paths)
+    numerator_log_weights = old_l_theta_paths + alpha_expanded * path_delta
+    rb_numerator = _logmeanexp_by_group(numerator_log_weights, group_ids)
+    rb_denominator = _logmeanexp_by_group(old_l_theta_paths, group_ids)
+    alpha_out = _bridge_alpha_for_output(alpha, torch.logsumexp(rb_denominator, dim=1))
+    first_order_weights = torch.softmax(rb_denominator, dim=1)
+    rb_delta = _softmax_mean_by_group(path_delta, old_l_theta_paths, group_ids)
+    first_order = (first_order_weights * rb_delta).sum(dim=1)
+    tempered = (torch.logsumexp(rb_numerator, dim=1) - torch.logsumexp(rb_denominator, dim=1)) / alpha_out.clamp_min(eps)
+    return torch.where(alpha_out.abs() < eps, first_order, tempered)
+
+
+def estimate_old_posterior_bridge_log_ratio(
+    l_theta_paths: torch.Tensor,
+    old_l_theta_paths: torch.Tensor,
+    alpha: float = 1.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Old-posterior bridge identity: log E_{P_old}[exp(alpha * delta)] / alpha.
+    """
+    return _estimate_tempered_bridge_log_ratio(l_theta_paths, old_l_theta_paths, alpha=alpha, eps=eps)
+
+
+def estimate_cumulant_bridge_log_ratio(
+    l_theta_paths: torch.Tensor,
+    old_l_theta_paths: torch.Tensor,
+    alpha: float = 1.0,
+    detach_weights: bool = True,
+) -> torch.Tensor:
+    path_delta = l_theta_paths - old_l_theta_paths
+    old_bridge_weights = torch.softmax(old_l_theta_paths, dim=1)
+    if detach_weights:
+        old_bridge_weights = old_bridge_weights.detach()
+    mean_delta = (old_bridge_weights * path_delta).sum(dim=1)
+    var_delta = (old_bridge_weights * (path_delta - mean_delta.unsqueeze(1)).square()).sum(dim=1)
+    alpha_for_cum = _bridge_alpha_for_output(alpha, mean_delta)
+    return mean_delta + 0.5 * alpha_for_cum * var_delta
+
+
+def estimate_fisher_bridge_score(
+    l_theta_paths: torch.Tensor,
+    detach_weights: bool = True,
+) -> torch.Tensor:
+    """
+    Self-normalized Fisher-bridge score surrogate E_{P_theta(tau|x,c)}[log F_theta(tau)].
+    """
+    posterior_weights = torch.softmax(l_theta_paths, dim=1)
+    if detach_weights:
+        posterior_weights = posterior_weights.detach()
+    return (posterior_weights * l_theta_paths).sum(dim=1)
+
+
+def estimate_pseudolikelihood_log_ratio(
+    l_theta_tokens: torch.Tensor,
+    old_l_theta_tokens: torch.Tensor,
+    response_mask: torch.Tensor | None = None,
+    scale: float = 1.0,
+    keep_token_shape: bool = True,
+) -> torch.Tensor:
+    """
+    Bethe / pseudo-likelihood ratio baseline from masked-token conditionals.
+    """
+    token_delta = (l_theta_tokens - old_l_theta_tokens) * float(scale)
+    if keep_token_shape:
+        return token_delta
+    if response_mask is None:
+        return token_delta.sum(dim=-1)
+    return (token_delta * response_mask).sum(dim=-1)
+
+
 def estimate_bridge_log_ratio(
     l_theta_paths: torch.Tensor,
     old_l_theta_paths: torch.Tensor,
+    estimator: str = "bridge",
     correction: str = "none",
     detach_correction: bool = True,
     eps: float = 1e-8,
+    alpha: float = 1.0,
+    adaptive_alpha: bool = False,
+    alpha_min: float = 0.0,
+    alpha_steps: int = 11,
+    ess_target: float = 0.3,
+    thermo_points: int = 5,
+    rb_group_ids: torch.Tensor | None = None,
+    rb_group_size: int | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """
     Estimate log p_theta(y|c) / p_old(y|c) from shared denoising paths.
 
     The estimator uses the coupled samples already produced by the dLLM forward
     corruption process:
-        logsumexp_k l_theta(tau_k) - logsumexp_k l_old(tau_k).
+        1/alpha * logsumexp_k[l_old(tau_k) + alpha * delta_k]
+        - 1/alpha * logsumexp_k[l_old(tau_k)].
+    alpha=1 recovers BridgeRatio; alpha<1 gives SafeBridge tempering.
     This directly targets the policy ratio needed by PPO/GRPO instead of
     subtracting two independently estimated sequence log-likelihoods.
     """
@@ -48,17 +281,61 @@ def estimate_bridge_log_ratio(
     assert l_theta_paths.dim() in (2, 3), f"expected (batch, paths) or (batch, paths, length), got {l_theta_paths.shape}"
 
     num_paths = l_theta_paths.size(1)
+    estimator = estimator.lower()
     correction = correction.lower()
-    log_ratio = torch.logsumexp(l_theta_paths, dim=1) - torch.logsumexp(old_l_theta_paths, dim=1)
+    selected_alpha = alpha
+    if adaptive_alpha:
+        selected_alpha, ess = select_bridge_alpha_by_ess(
+            l_theta_paths=l_theta_paths,
+            old_l_theta_paths=old_l_theta_paths,
+            alpha_max=alpha,
+            alpha_min=alpha_min,
+            alpha_steps=alpha_steps,
+            ess_target=ess_target,
+        )
+    else:
+        ess = _bridge_effective_sample_size(l_theta_paths, old_l_theta_paths, alpha)
+
+    if estimator in ("bridge", "bridgeratio", "old_posterior", "old-posterior", "safebridge", "safe_bridge"):
+        log_ratio = estimate_old_posterior_bridge_log_ratio(
+            l_theta_paths=l_theta_paths,
+            old_l_theta_paths=old_l_theta_paths,
+            alpha=selected_alpha,
+            eps=eps,
+        )
+    elif estimator in ("cumulant", "cum2", "cumulant_ratio"):
+        log_ratio = estimate_cumulant_bridge_log_ratio(
+            l_theta_paths=l_theta_paths,
+            old_l_theta_paths=old_l_theta_paths,
+            alpha=selected_alpha,
+            detach_weights=detach_correction,
+        )
+        correction = "off" if correction in ("none", "off", "") else correction
+    elif estimator in ("thermo", "thermobridge", "thermo_bridge"):
+        log_ratio = estimate_thermobridge_log_ratio(l_theta_paths, old_l_theta_paths, num_points=thermo_points)
+        correction = "off" if correction in ("none", "off", "") else correction
+    elif estimator in ("rao_blackwell", "rao-blackwell", "rb", "rb_bridge"):
+        log_ratio = estimate_rao_blackwellized_bridge_log_ratio(
+            l_theta_paths=l_theta_paths,
+            old_l_theta_paths=old_l_theta_paths,
+            alpha=selected_alpha,
+            group_ids=rb_group_ids,
+            group_size=rb_group_size,
+            eps=eps,
+        )
+    else:
+        raise ValueError(f"Unsupported bridge-ratio estimator: {estimator}")
     correction_term = torch.zeros_like(log_ratio)
 
     if correction in ("none", "off", ""):
         pass
     elif correction in ("delta", "bias", "bias_correction"):
+        alpha_for_bias = _bridge_alpha_for_output(selected_alpha, log_ratio).abs().clamp_min(eps)
+        numerator_log_weights = old_l_theta_paths + _expand_bridge_alpha(selected_alpha, old_l_theta_paths) * (l_theta_paths - old_l_theta_paths)
         correction_term = 0.5 / max(num_paths, 1) * (
-            _cv_squared_from_log_weights(l_theta_paths, eps=eps)
+            _cv_squared_from_log_weights(numerator_log_weights, eps=eps)
             - _cv_squared_from_log_weights(old_l_theta_paths, eps=eps)
-        )
+        ) / alpha_for_bias
         if detach_correction:
             correction_term = correction_term.detach()
         log_ratio = log_ratio + correction_term
@@ -68,36 +345,72 @@ def estimate_bridge_log_ratio(
             for idx in range(num_paths):
                 keep = [path_idx for path_idx in range(num_paths) if path_idx != idx]
                 loo_estimates.append(
-                    torch.logsumexp(l_theta_paths[:, keep, ...], dim=1)
-                    - torch.logsumexp(old_l_theta_paths[:, keep, ...], dim=1)
+                    _estimate_tempered_bridge_log_ratio(
+                        l_theta_paths[:, keep, ...],
+                        old_l_theta_paths[:, keep, ...],
+                        alpha=selected_alpha,
+                        eps=eps,
+                    )
                 )
             loo_mean = torch.stack(loo_estimates, dim=1).mean(dim=1)
             log_ratio = num_paths * log_ratio - (num_paths - 1) * loo_mean
             correction_term = log_ratio - (
-                torch.logsumexp(l_theta_paths, dim=1) - torch.logsumexp(old_l_theta_paths, dim=1)
+                estimate_old_posterior_bridge_log_ratio(l_theta_paths, old_l_theta_paths, alpha=selected_alpha, eps=eps)
             )
-    elif correction == "cumulant":
-        path_delta = l_theta_paths - old_l_theta_paths
-        old_bridge_weights = torch.softmax(old_l_theta_paths, dim=1)
-        if detach_correction:
-            old_bridge_weights = old_bridge_weights.detach()
-        mean_delta = (old_bridge_weights * path_delta).sum(dim=1)
-        var_delta = (old_bridge_weights * (path_delta - mean_delta.unsqueeze(1)).square()).sum(dim=1)
-        log_ratio = mean_delta + 0.5 * var_delta
+    elif correction in ("cumulant", "cum2"):
+        log_ratio = estimate_cumulant_bridge_log_ratio(
+            l_theta_paths=l_theta_paths,
+            old_l_theta_paths=old_l_theta_paths,
+            alpha=selected_alpha,
+            detach_weights=detach_correction,
+        )
         correction_term = log_ratio - (
-            torch.logsumexp(l_theta_paths, dim=1) - torch.logsumexp(old_l_theta_paths, dim=1)
+            estimate_old_posterior_bridge_log_ratio(l_theta_paths, old_l_theta_paths, alpha=selected_alpha, eps=eps)
+        )
+    elif correction in ("thermo", "thermobridge"):
+        log_ratio = estimate_thermobridge_log_ratio(l_theta_paths, old_l_theta_paths, num_points=thermo_points)
+        correction_term = log_ratio - (
+            estimate_old_posterior_bridge_log_ratio(l_theta_paths, old_l_theta_paths, alpha=selected_alpha, eps=eps)
         )
     else:
         raise ValueError(f"Unsupported bridge-ratio correction: {correction}")
 
     with torch.no_grad():
         ratio = torch.exp(log_ratio.clamp(min=-30, max=30))
+        alpha_tensor = selected_alpha if isinstance(selected_alpha, torch.Tensor) else torch.tensor(float(selected_alpha), device=log_ratio.device)
         metrics = {
             "bridge_ratio/log_ratio_mean": log_ratio.mean(),
             "bridge_ratio/log_ratio_abs_mean": log_ratio.abs().mean(),
             "bridge_ratio/ratio_mean": ratio.mean(),
             "bridge_ratio/ratio_max": ratio.max(),
             "bridge_ratio/correction_mean": correction_term.mean(),
+            "bridge_ratio/alpha_mean": alpha_tensor.float().mean(),
+            "bridge_ratio/alpha_min": alpha_tensor.float().min(),
+            "bridge_ratio/ess_mean": ess.float().mean(),
+            "bridge_ratio/ess_min": ess.float().min(),
+            "bridge_ratio/estimator_id": torch.tensor(
+                float(
+                    {
+                        "bridge": 0,
+                        "bridgeratio": 0,
+                        "old_posterior": 1,
+                        "old-posterior": 1,
+                        "safebridge": 2,
+                        "safe_bridge": 2,
+                        "cumulant": 3,
+                        "cum2": 3,
+                        "cumulant_ratio": 3,
+                        "thermo": 4,
+                        "thermobridge": 4,
+                        "thermo_bridge": 4,
+                        "rao_blackwell": 5,
+                        "rao-blackwell": 5,
+                        "rb": 5,
+                        "rb_bridge": 5,
+                    }.get(estimator, -1)
+                ),
+                device=log_ratio.device,
+            ),
             "bridge_ratio/num_paths": torch.tensor(float(num_paths), device=log_ratio.device),
         }
 
@@ -114,9 +427,18 @@ def compute_policy_loss_bridgeratio(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    estimator: str = "bridge",
     correction: str = "none",
     detach_correction: bool = True,
     ratio_log_clip: float | None = None,
+    alpha: float = 1.0,
+    adaptive_alpha: bool = False,
+    alpha_min: float = 0.0,
+    alpha_steps: int = 11,
+    ess_target: float = 0.3,
+    thermo_points: int = 5,
+    rb_group_ids: torch.Tensor | None = None,
+    rb_group_size: int | None = None,
 ):
     """
     Compute PPO/GRPO loss from a coupled BridgeRatio path estimator.
@@ -128,8 +450,17 @@ def compute_policy_loss_bridgeratio(
     log_ratio, bridge_metrics = estimate_bridge_log_ratio(
         l_theta_paths=l_theta_paths,
         old_l_theta_paths=old_l_theta_paths,
+        estimator=estimator,
         correction=correction,
         detach_correction=detach_correction,
+        alpha=alpha,
+        adaptive_alpha=adaptive_alpha,
+        alpha_min=alpha_min,
+        alpha_steps=alpha_steps,
+        ess_target=ess_target,
+        thermo_points=thermo_points,
+        rb_group_ids=rb_group_ids,
+        rb_group_size=rb_group_size,
     )
     if log_ratio.dim() == 1:
         log_ratio = log_ratio.unsqueeze(-1).expand_as(advantages)
@@ -158,6 +489,70 @@ def compute_policy_loss_bridgeratio(
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, bridge_metrics
+
+
+def compute_policy_loss_fisher_bridge(
+    l_theta_paths,
+    advantages,
+    response_mask,
+    loss_agg_mode: str = "token-mean",
+    detach_weights: bool = True,
+):
+    fisher_score = estimate_fisher_bridge_score(l_theta_paths, detach_weights=detach_weights)
+    if fisher_score.dim() == 1:
+        fisher_score = fisher_score.unsqueeze(-1).expand_as(advantages)
+    pg_loss = agg_loss(loss_mat=-advantages * fisher_score, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    zero = torch.zeros((), device=pg_loss.device, dtype=pg_loss.dtype)
+    metrics = {
+        "bridge_ratio/fisher_score_mean": fisher_score.detach().mean(),
+        "bridge_ratio/fisher_score_abs_mean": fisher_score.detach().abs().mean(),
+    }
+    return pg_loss, zero, zero, zero, metrics
+
+
+def compute_policy_loss_pseudolikelihood_ratio(
+    old_l_theta,
+    l_theta,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+    scale: float = 1.0,
+    ratio_log_clip: float | None = None,
+):
+    log_ratio = estimate_pseudolikelihood_log_ratio(
+        l_theta_tokens=l_theta,
+        old_l_theta_tokens=old_l_theta,
+        response_mask=response_mask,
+        scale=scale,
+        keep_token_shape=True,
+    )
+    if ratio_log_clip is not None:
+        log_ratio = log_ratio.clamp(min=-ratio_log_clip, max=ratio_log_clip)
+    ratio = torch.exp(log_ratio)
+    ppo_kl = verl_F.masked_mean(torch.exp(-log_ratio) + log_ratio - 1, response_mask)
+
+    pg_losses1 = -advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    metrics = {
+        "bridge_ratio/pll_log_ratio_mean": log_ratio.detach().mean(),
+        "bridge_ratio/pll_log_ratio_abs_mean": log_ratio.detach().abs().mean(),
+    }
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, metrics
 
 
 def compute_policy_loss_bgpo(

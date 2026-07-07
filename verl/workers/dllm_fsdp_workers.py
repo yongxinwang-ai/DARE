@@ -76,6 +76,47 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
+BRIDGE_RATIO_ALGORITHM_DEFAULTS = {
+    "bridgeratio-grpo": {"bridge_ratio_estimator": "bridge"},
+    "old-posterior-grpo": {"bridge_ratio_estimator": "old_posterior"},
+    "safebridge-grpo": {
+        "bridge_ratio_estimator": "safebridge",
+        "bridge_ratio_adaptive_alpha": True,
+        "bridge_ratio_alpha": 1.0,
+        "bridge_ratio_alpha_min": 0.0,
+        "bridge_ratio_alpha_steps": 11,
+        "bridge_ratio_ess_target": 0.3,
+    },
+    "cumulant-ratio-grpo": {"bridge_ratio_estimator": "cumulant"},
+    "thermobridge-grpo": {
+        "bridge_ratio_estimator": "thermo",
+        "bridge_ratio_thermo_points": 5,
+    },
+    "rao-blackwell-grpo": {
+        "bridge_ratio_estimator": "rao_blackwell",
+        "bridge_ratio_rb_group_size": 2,
+    },
+    "rb-bridgeratio-grpo": {
+        "bridge_ratio_estimator": "rao_blackwell",
+        "bridge_ratio_rb_group_size": 2,
+    },
+    "fisher-bridge-grpo": {"bridge_ratio_estimator": "fisher"},
+    "bethe-grpo": {"bridge_ratio_estimator": "pseudolikelihood"},
+    "pll-grpo": {"bridge_ratio_estimator": "pseudolikelihood"},
+}
+BRIDGE_RATIO_ALGORITHMS = tuple(BRIDGE_RATIO_ALGORITHM_DEFAULTS.keys())
+COUPLED_FORWARD_ALGORITHMS = ("coupled-grpo", *BRIDGE_RATIO_ALGORITHMS)
+
+
+def _apply_bridge_ratio_actor_defaults(config: DictConfig):
+    defaults = BRIDGE_RATIO_ALGORITHM_DEFAULTS.get(config.algorithm.name)
+    if defaults is None:
+        return
+    with open_dict(config.actor):
+        for key, value in defaults.items():
+            if key not in config.actor or config.actor.get(key) is None:
+                config.actor[key] = value
+
 
 class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
     def _build_model_optimizer(
@@ -574,7 +615,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_spg import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'coupled-grpo':
                 from verl.workers.actor.llada_dp_actor_coupled_grpo import DLLMDataParallelPPOActor
-            elif self.config.algorithm.name == 'bridgeratio-grpo':
+            elif self.config.algorithm.name in BRIDGE_RATIO_ALGORITHMS:
                 from verl.workers.actor.llada_dp_actor_bridgeratio_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'cj-grpo':
                 from verl.workers.actor.llada_dp_actor_cj_grpo import DLLMDataParallelPPOActor
@@ -604,7 +645,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.dream_dp_actor_spg import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'coupled-grpo':
                 from verl.workers.actor.dream_dp_actor_coupled_grpo import DLLMDataParallelPPOActor
-            elif self.config.algorithm.name == 'bridgeratio-grpo':
+            elif self.config.algorithm.name in BRIDGE_RATIO_ALGORITHMS:
                 from verl.workers.actor.dream_dp_actor_bridgeratio_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'cj-grpo':
                 from verl.workers.actor.dream_dp_actor_cj_grpo import DLLMDataParallelPPOActor
@@ -688,6 +729,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 self.config.actor.use_fused_kernels = use_fused_kernels
                 if self.config.model.name == 'sdar' and self.config.algorithm.name == 'ebpo':
                     self.config.actor.block_length = self.config.rollout.get('block_length', self.config.actor.get('block_length', 4))
+            _apply_bridge_ratio_actor_defaults(self.config)
             self.actor = DLLMDataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout and not self.config.algorithm.name in ["vrpo"]:
@@ -835,11 +877,11 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         MASK_TOKEN_ID = self.actor_module_fsdp.config.mask_token_id
 
         # select _forward_process according to algorithm
-        if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "coupled-grpo", "bridgeratio-grpo", "vrpo"]:
+        if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "vrpo", *COUPLED_FORWARD_ALGORITHMS]:
             if self.config.algorithm.name == "d1":
                 assert n_l == mc_num == 1, "d1 method requires n_l == mc_num == 1"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_d1 as _forward_process
-            elif self.config.algorithm.name in ["coupled-grpo", "bridgeratio-grpo"]:
+            elif self.config.algorithm.name in COUPLED_FORWARD_ALGORITHMS:
                 assert n_l == mc_num == 1, f"{self.config.algorithm.name} method requires n_l == mc_num == 1"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_coupled_grpo as _forward_process
             elif self.config.algorithm.name == "bgpo":

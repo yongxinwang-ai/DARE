@@ -39,6 +39,54 @@ while [[ $# -gt 0 ]]; do
       engine="$2"
       shift; shift
       ;;
+    --bridge_ratio_estimator)
+      bridge_ratio_estimator="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_alpha)
+      bridge_ratio_alpha="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_adaptive_alpha)
+      bridge_ratio_adaptive_alpha="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_alpha_min)
+      bridge_ratio_alpha_min="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_alpha_steps)
+      bridge_ratio_alpha_steps="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_ess_target)
+      bridge_ratio_ess_target="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_thermo_points)
+      bridge_ratio_thermo_points="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_rb_group_size)
+      bridge_ratio_rb_group_size="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_correction)
+      bridge_ratio_correction="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_score_scale)
+      bridge_ratio_score_scale="$2"
+      shift; shift
+      ;;
+    --bridge_ratio_log_clip)
+      bridge_ratio_log_clip="$2"
+      shift; shift
+      ;;
+    --pseudolikelihood_scale)
+      pseudolikelihood_scale="$2"
+      shift; shift
+      ;;
     *)
       shift
       ;;
@@ -67,7 +115,11 @@ if [[ ! " ${valid_models[@]} " =~ " ${model} " ]]; then
 fi
 
 # validate algorithm
-valid_algorithms=("d1" "coupled-grpo" "bridgeratio-grpo" "mdpo" "cj-grpo" "spg" "bgpo")
+valid_algorithms=(
+    "d1" "coupled-grpo" "bridgeratio-grpo" "old-posterior-grpo" "safebridge-grpo"
+    "cumulant-ratio-grpo" "thermobridge-grpo" "rao-blackwell-grpo" "rb-bridgeratio-grpo"
+    "fisher-bridge-grpo" "bethe-grpo" "pll-grpo" "mdpo" "cj-grpo" "spg" "bgpo"
+)
 if [[ ! " ${valid_algorithms[@]} " =~ " ${algorithm} " ]]; then
     echo "Error: Invalid algorithm '$algorithm'"
     echo "Supported algorithms: ${valid_algorithms[*]}"
@@ -149,6 +201,50 @@ block_length=32
 mc_num=1
 n_l=1
 
+case $algorithm in
+    "bridgeratio-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-bridge}
+        ;;
+    "old-posterior-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-old_posterior}
+        ;;
+    "safebridge-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-safebridge}
+        if [[ -z "${bridge_ratio_adaptive_alpha+x}" ]]; then bridge_ratio_adaptive_alpha=true; fi
+        ;;
+    "cumulant-ratio-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-cumulant}
+        ;;
+    "thermobridge-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-thermo}
+        ;;
+    "rao-blackwell-grpo"|"rb-bridgeratio-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-rao_blackwell}
+        if [[ -z "${bridge_ratio_rb_group_size+x}" ]]; then bridge_ratio_rb_group_size=2; fi
+        ;;
+    "fisher-bridge-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-fisher}
+        ;;
+    "bethe-grpo"|"pll-grpo")
+        bridge_ratio_estimator=${bridge_ratio_estimator:-pseudolikelihood}
+        ;;
+    *)
+        bridge_ratio_estimator=${bridge_ratio_estimator:-bridge}
+        ;;
+esac
+
+bridge_ratio_correction=${bridge_ratio_correction:-none}
+bridge_ratio_score_scale=${bridge_ratio_score_scale:-token}
+bridge_ratio_alpha=${bridge_ratio_alpha:-1.0}
+bridge_ratio_adaptive_alpha=${bridge_ratio_adaptive_alpha:-false}
+bridge_ratio_alpha_min=${bridge_ratio_alpha_min:-0.0}
+bridge_ratio_alpha_steps=${bridge_ratio_alpha_steps:-11}
+bridge_ratio_ess_target=${bridge_ratio_ess_target:-0.3}
+bridge_ratio_thermo_points=${bridge_ratio_thermo_points:-5}
+bridge_ratio_rb_group_size=${bridge_ratio_rb_group_size:-none}
+bridge_ratio_log_clip=${bridge_ratio_log_clip:-none}
+pseudolikelihood_scale=${pseudolikelihood_scale:-1.0}
+
 timestamp=$(date +"%Y%m%d_%H%M%S")
 project_name=$WANDB_PROJECT
 exp_name="${baseline}-bsz${batch_size}-n${n_rollout}-prompt${max_prompt_length}-response${max_response_length}-step${num_diffusion_steps}-lr${lr}-temp${train_temperature}-n_l${n_l}-mc_num${mc_num}-gpu${n_gpus_per_node}-${timestamp}"
@@ -198,8 +294,18 @@ python3 -m verl.trainer.dllm_main_ppo \
     +actor_rollout_ref.actor.mc_num=$mc_num \
     +actor_rollout_ref.actor.n_l=$n_l \
     +actor_rollout_ref.actor.cfg_scale=0.0 \
-    +actor_rollout_ref.actor.bridge_ratio_correction=none \
-    +actor_rollout_ref.actor.bridge_ratio_score_scale=token \
+    +actor_rollout_ref.actor.bridge_ratio_estimator=$bridge_ratio_estimator \
+    +actor_rollout_ref.actor.bridge_ratio_correction=$bridge_ratio_correction \
+    +actor_rollout_ref.actor.bridge_ratio_score_scale=$bridge_ratio_score_scale \
+    +actor_rollout_ref.actor.bridge_ratio_alpha=$bridge_ratio_alpha \
+    +actor_rollout_ref.actor.bridge_ratio_adaptive_alpha=$bridge_ratio_adaptive_alpha \
+    +actor_rollout_ref.actor.bridge_ratio_alpha_min=$bridge_ratio_alpha_min \
+    +actor_rollout_ref.actor.bridge_ratio_alpha_steps=$bridge_ratio_alpha_steps \
+    +actor_rollout_ref.actor.bridge_ratio_ess_target=$bridge_ratio_ess_target \
+    +actor_rollout_ref.actor.bridge_ratio_thermo_points=$bridge_ratio_thermo_points \
+    +actor_rollout_ref.actor.bridge_ratio_rb_group_size=$bridge_ratio_rb_group_size \
+    +actor_rollout_ref.actor.bridge_ratio_log_clip=$bridge_ratio_log_clip \
+    +actor_rollout_ref.actor.pseudolikelihood_scale=$pseudolikelihood_scale \
     +actor_rollout_ref.actor.baseline=$baseline \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=hf \

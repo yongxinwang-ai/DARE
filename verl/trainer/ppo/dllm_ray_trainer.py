@@ -8,6 +8,21 @@ from verl.trainer.ppo.mdpo_algos import compute_step_wise_advantage, select_top_
 from verl.trainer.ppo.dtreerpo_algos import compute_dtreerpo_rewards_and_segments
 
 
+BRIDGE_RATIO_ALGORITHMS = (
+    "bridgeratio-grpo",
+    "old-posterior-grpo",
+    "safebridge-grpo",
+    "cumulant-ratio-grpo",
+    "thermobridge-grpo",
+    "rao-blackwell-grpo",
+    "rb-bridgeratio-grpo",
+    "fisher-bridge-grpo",
+    "bethe-grpo",
+    "pll-grpo",
+)
+COUPLED_FORWARD_ALGORITHMS = ("coupled-grpo", *BRIDGE_RATIO_ALGORITHMS)
+
+
 class DLLMRayPPOTrainer(RayPPOTrainer):
     def _validate(self):
         data_source_lst = []
@@ -240,7 +255,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    if self.config.algorithm.name in ["d1", "coupled-grpo", "bridgeratio-grpo", "bgpo", "ebpo", "spg"]:
+                    if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "spg", *COUPLED_FORWARD_ALGORITHMS]:
                         with _timer("forward_process", timing_raw):
                             forward_batch_output = self.actor_rollout_wg.forward_process(batch)
                         batch = batch.union(forward_batch_output)
@@ -316,7 +331,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                             "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                         }
                                     )
-                        elif self.config.algorithm.name in ["coupled-grpo", "bridgeratio-grpo"]:
+                        elif self.config.algorithm.name in COUPLED_FORWARD_ALGORITHMS:
                             # recompute old_log_probs
                             with _timer("old_log_prob", timing_raw):
                                 old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)

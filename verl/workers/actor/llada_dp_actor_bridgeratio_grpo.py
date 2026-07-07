@@ -19,7 +19,13 @@ import logging
 import os
 
 from verl import DataProto
-from verl.trainer.ppo.dllm_core_algos import agg_loss, compute_policy_loss_bridgeratio, kl_penalty
+from verl.trainer.ppo.dllm_core_algos import (
+    agg_loss,
+    compute_policy_loss_bridgeratio,
+    compute_policy_loss_fisher_bridge,
+    compute_policy_loss_pseudolikelihood_ratio,
+    kl_penalty,
+)
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_torch_device
 from verl.utils.py_functional import append_to_dict
@@ -32,13 +38,38 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
+def _none_if_string(value):
+    if isinstance(value, str) and value.lower() in ("none", "null", ""):
+        return None
+    return value
+
+
 class DLLMDataParallelPPOActor(CoupledDataParallelPPOActor):
     def __init__(self, config, actor_module, actor_optimizer=None):
         super().__init__(config, actor_module, actor_optimizer)
+        self.bridge_ratio_estimator = config.get("bridge_ratio_estimator", "bridge")
         self.bridge_ratio_correction = config.get("bridge_ratio_correction", "none")
-        self.bridge_ratio_detach_correction = config.get("bridge_ratio_detach_correction", True)
+        self.bridge_ratio_detach_correction = _as_bool(config.get("bridge_ratio_detach_correction", True))
         self.bridge_ratio_score_scale = config.get("bridge_ratio_score_scale", "token")
-        self.bridge_ratio_log_clip = config.get("bridge_ratio_log_clip", None)
+        self.bridge_ratio_log_clip = _none_if_string(config.get("bridge_ratio_log_clip", None))
+        if self.bridge_ratio_log_clip is not None:
+            self.bridge_ratio_log_clip = float(self.bridge_ratio_log_clip)
+        self.bridge_ratio_alpha = float(config.get("bridge_ratio_alpha", 1.0))
+        self.bridge_ratio_adaptive_alpha = _as_bool(config.get("bridge_ratio_adaptive_alpha", False))
+        self.bridge_ratio_alpha_min = float(config.get("bridge_ratio_alpha_min", 0.0))
+        self.bridge_ratio_alpha_steps = int(config.get("bridge_ratio_alpha_steps", 11))
+        self.bridge_ratio_ess_target = float(config.get("bridge_ratio_ess_target", 0.3))
+        self.bridge_ratio_thermo_points = int(config.get("bridge_ratio_thermo_points", 5))
+        self.bridge_ratio_rb_group_size = _none_if_string(config.get("bridge_ratio_rb_group_size", None))
+        if self.bridge_ratio_rb_group_size is not None:
+            self.bridge_ratio_rb_group_size = int(self.bridge_ratio_rb_group_size)
+        self.pseudolikelihood_scale = float(config.get("pseudolikelihood_scale", 1.0))
 
     def _scale_bridge_path_scores(self, path_scores, response_mask, response_length):
         """Map DARE's normalized per-path scores to the requested ratio scale."""
@@ -64,6 +95,7 @@ class DLLMDataParallelPPOActor(CoupledDataParallelPPOActor):
             "input_ids",
             "attention_mask",
             "position_ids",
+            "old_log_probs",
             "old_loss_per_sample",
             "advantages",
             "perturbed_seq",
@@ -115,6 +147,7 @@ class DLLMDataParallelPPOActor(CoupledDataParallelPPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     advantages = micro_batch["advantages"]
+                    old_log_probs = micro_batch["old_log_probs"][:, -response_length:]
                     old_path_scores = micro_batch["old_loss_per_sample"][:, :, -response_length:]
 
                     clip_ratio = self.config.clip_ratio
@@ -138,20 +171,52 @@ class DLLMDataParallelPPOActor(CoupledDataParallelPPOActor):
                     old_path_scores = self._scale_bridge_path_scores(old_path_scores, response_mask, response_length)
                     path_scores = self._scale_bridge_path_scores(path_scores, response_mask, response_length)
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, bridge_metrics = compute_policy_loss_bridgeratio(
-                        old_l_theta_paths=old_path_scores,
-                        l_theta_paths=path_scores,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        cliprange=clip_ratio,
-                        cliprange_low=clip_ratio_low,
-                        cliprange_high=clip_ratio_high,
-                        clip_ratio_c=clip_ratio_c,
-                        loss_agg_mode=loss_agg_mode,
-                        correction=self.bridge_ratio_correction,
-                        detach_correction=self.bridge_ratio_detach_correction,
-                        ratio_log_clip=self.bridge_ratio_log_clip,
-                    )
+                    estimator = str(self.bridge_ratio_estimator).lower()
+                    if estimator in ("fisher", "fisher_bridge", "fisher-bridge"):
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, bridge_metrics = compute_policy_loss_fisher_bridge(
+                            l_theta_paths=path_scores,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            detach_weights=self.bridge_ratio_detach_correction,
+                        )
+                    elif estimator in ("pseudolikelihood", "pseudo_likelihood", "pll", "bethe", "bethe_ratio"):
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, bridge_metrics = compute_policy_loss_pseudolikelihood_ratio(
+                            old_l_theta=old_log_probs,
+                            l_theta=log_probs,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                            scale=self.pseudolikelihood_scale,
+                            ratio_log_clip=self.bridge_ratio_log_clip,
+                        )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, bridge_metrics = compute_policy_loss_bridgeratio(
+                            old_l_theta_paths=old_path_scores,
+                            l_theta_paths=path_scores,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                            estimator=self.bridge_ratio_estimator,
+                            correction=self.bridge_ratio_correction,
+                            detach_correction=self.bridge_ratio_detach_correction,
+                            ratio_log_clip=self.bridge_ratio_log_clip,
+                            alpha=self.bridge_ratio_alpha,
+                            adaptive_alpha=self.bridge_ratio_adaptive_alpha,
+                            alpha_min=self.bridge_ratio_alpha_min,
+                            alpha_steps=self.bridge_ratio_alpha_steps,
+                            ess_target=self.bridge_ratio_ess_target,
+                            thermo_points=self.bridge_ratio_thermo_points,
+                            rb_group_size=self.bridge_ratio_rb_group_size,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(
